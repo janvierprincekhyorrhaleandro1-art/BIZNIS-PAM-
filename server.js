@@ -15,9 +15,17 @@ const supabase = process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_K
   ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
   : null;
 const metaReady = Boolean(process.env.META_ACCESS_TOKEN && process.env.META_PHONE_NUMBER_ID);
-const aiReady = Boolean(process.env.AI_API_KEY && process.env.AI_MODEL);
+const bazaarReady = Boolean(process.env.BAZAARLINK_API_KEY && process.env.BAZAARLINK_MODEL);
+const groqReady = Boolean(process.env.GROQ_API_KEY && process.env.GROQ_MODEL);
 
-app.get("/api/health", (_req, res) => res.json({ ok: true, app: "BIZNIS PAM", databaseConfigured: Boolean(supabase), whatsappConfigured: metaReady, aiConfigured: aiReady, timestamp: new Date().toISOString() }));
+app.get("/api/health", (_req, res) => res.json({
+  ok: true,
+  app: "BIZNIS PAM",
+  databaseConfigured: Boolean(supabase),
+  whatsappConfigured: metaReady,
+  aiProviders: { bazaarLinkConfigured: bazaarReady, groqConfigured: groqReady, fallbackOrder: ["BazaarLink", "Groq"] },
+  timestamp: new Date().toISOString()
+}));
 
 async function dbList(table, merchantId) {
   if (!supabase) return { data: [], error: "Database is not configured yet." };
@@ -55,16 +63,56 @@ async function findProducts(message) {
   const terms = String(message).toLocaleLowerCase().split(/\W+/).filter(w => w.length > 2);
   return (data || []).filter(p => terms.some(t => p.name.toLocaleLowerCase().includes(t) || (p.description || "").toLocaleLowerCase().includes(t))).slice(0, 8);
 }
+async function callAIProvider(provider, message, productFacts) {
+  const isBazaar = provider.name === "BazaarLink";
+  const endpoint = isBazaar
+    ? (process.env.BAZAARLINK_API_URL || "https://api.bazaarlink.ai/v1/chat/completions")
+    : (process.env.GROQ_API_URL || "https://api.groq.com/openai/v1/chat/completions");
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${provider.key}`,
+      "Content-Type": "application/json",
+      ...(isBazaar ? { "X-Free-Fallback": "false", "X-Title": "BIZNIS PAM" } : {})
+    },
+    body: JSON.stringify({
+      model: provider.model,
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: "You are the customer service and sales assistant for a merchant in Haiti. Reply in the customer's language (Haitian Creole, French, or English). Use ONLY the product facts supplied below. Never invent prices, discounts, availability, delivery promises, or policies. If facts are missing, say a human teammate will confirm. Be concise, polite, and helpful. If the customer asks for a person, has a complaint, payment issue, or the request is unclear, recommend human handoff. Product facts:\n" + productFacts },
+        { role: "user", content: String(message).slice(0, 3000) }
+      ]
+    })
+  });
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(json.error?.message || `${provider.name} request failed with HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  const answer = json.choices?.[0]?.message?.content?.trim();
+  if (!answer) throw new Error(`${provider.name} returned an empty response.`);
+  return answer;
+}
 async function draftReply(message, products) {
-  if (!aiReady) return null;
   const productFacts = products.map(p => `${p.name}: price ${p.price} ${p.currency}; stock ${p.stock}; description ${p.description || "not provided"}`).join("\n") || "No matching product facts found.";
-  const response = await fetch(process.env.AI_BASE_URL || "https://api.groq.com/openai/v1/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${process.env.AI_API_KEY}`, "Content-Type": "application/json" }, body: JSON.stringify({ model: process.env.AI_MODEL, temperature: 0.2, messages: [
-    { role: "system", content: "You are the customer service and sales assistant for a merchant in Haiti. Reply in the customer's language (Haitian Creole, French, or English). Use ONLY the product facts supplied below. Never invent prices, discounts, availability, delivery promises, or policies. If facts are missing, say a human teammate will confirm. Be concise, polite, and helpful. If the customer asks for a person, has a complaint, payment issue, or the request is unclear, recommend human handoff. Product facts:\n" + productFacts },
-    { role: "user", content: String(message).slice(0, 3000) }
-  ] }) });
-  const json = await response.json();
-  if (!response.ok) throw new Error(json.error?.message || "AI provider request failed.");
-  return json.choices?.[0]?.message?.content?.trim() || null;
+  const providers = [
+    { name: "BazaarLink", key: process.env.BAZAARLINK_API_KEY, model: process.env.BAZAARLINK_MODEL },
+    { name: "Groq", key: process.env.GROQ_API_KEY, model: process.env.GROQ_MODEL }
+  ].filter(p => p.key && p.model);
+  if (!providers.length) return null;
+  let lastError;
+  for (const provider of providers) {
+    try {
+      const answer = await callAIProvider(provider, message, productFacts);
+      console.log(`AI provider used: ${provider.name}`);
+      return answer;
+    } catch (error) {
+      lastError = error;
+      console.error(`AI provider ${provider.name} failed; trying next provider:`, error.message);
+    }
+  }
+  throw lastError || new Error("No AI provider is configured.");
 }
 async function processIncomingWhatsApp(value) {
   for (const message of value?.messages || []) {
@@ -76,7 +124,7 @@ async function processIncomingWhatsApp(value) {
     if (!reply) reply = "Mèsi paske ou kontakte nou. Nou resevwa mesaj ou a; yon manm ekip nou an ap ede w byento. / Merci, nous avons reçu votre message. Un membre de notre équipe vous répondra bientôt.";
     try {
       await sendWhatsApp(message.from, reply);
-      if (supabase) await supabase.from("conversations").insert({ customer_phone: message.from, channel: "whatsapp", customer_message: text, assistant_reply: reply, status: aiReady ? "replied" : "human_handoff" });
+      if (supabase) await supabase.from("conversations").insert({ customer_phone: message.from, channel: "whatsapp", customer_message: text, assistant_reply: reply, status: reply && (bazaarReady || groqReady) ? "replied" : "human_handoff" });
     } catch (e) { console.error("WhatsApp processing error:", e.message); }
   }
 }
